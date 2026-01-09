@@ -18,7 +18,7 @@ SUPPORT_USERNAME = "Soulxmerchant"
 # ADMIN SETTINGS
 # =========================
 ADMIN_IDS = [
-    6670166083,
+    6670166083,7677304116
 ]
 
 # =========================
