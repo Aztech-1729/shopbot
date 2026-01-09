@@ -312,13 +312,14 @@ def kb_main(user_id: int) -> InlineKeyboardMarkup:
     b.button(text="📦 My Orders", callback_data="menu_orders")
     b.button(text="💼 Wallet", callback_data="menu_wallet")
     b.button(text="📞 Support", callback_data="menu_support")
+    b.button(text="👤 My Profile", callback_data="menu_profile")
     if is_admin(user_id):
         b.button(text="🛠 Admin Panel", callback_data="admin_home")
-        # rows: [Buy, AddFunds], [Orders, Wallet], [Support, Admin]
-        b.adjust(2, 2, 2)
+        # rows: [Buy, AddFunds], [Orders, Wallet], [Support, Profile, Admin]
+        b.adjust(2, 2, 3)
     else:
-        # rows: [Buy, AddFunds], [Orders, Wallet], [Support]
-        b.adjust(2, 2, 1)
+        # rows: [Buy, AddFunds], [Orders, Wallet], [Support, Profile]
+        b.adjust(2, 2, 2)
     return b.as_markup()
 
 
@@ -407,21 +408,27 @@ def kb_payment_method(method_key: str) -> InlineKeyboardMarkup:
 
 def kb_admin_home() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="⏳ Pending Payments", callback_data="admin_payments")
+    b.button(text="💳 Payments", callback_data="admin_payments_menu")
     b.button(text="📦 Products", callback_data="admin_products")
     b.button(text="📥 Add Stock", callback_data="admin_stock")
     b.button(text="🏷 Discounts", callback_data="admin_discounts")
-    b.button(text="👤 Users", callback_data="admin_users")
+    b.button(text="👥 All Users", callback_data="admin_all_users")
     b.button(text="⬅️ Back", callback_data="home")
     b.adjust(2, 2, 1)
     return b.as_markup()
 
 
-def kb_admin_payment_review(payment_id: str) -> InlineKeyboardMarkup:
+def kb_admin_payment_review(payment_id: str, status: str = "pending") -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Approve", callback_data=f"admin_pay:{payment_id}:approve")
-    b.button(text="❌ Reject", callback_data=f"admin_pay:{payment_id}:reject")
-    b.button(text="⬅️ Back", callback_data="admin_payments")
+    if status == "pending":
+        b.button(text="✅ Approve", callback_data=f"admin_pay:{payment_id}:approve")
+        b.button(text="❌ Reject", callback_data=f"admin_pay:{payment_id}:reject")
+        b.button(text="⬅️ Back", callback_data="admin_payments_pending:0")
+    elif status == "approved":
+        b.button(text="🔄 Resend Notification", callback_data=f"admin_pay:{payment_id}:resend")
+        b.button(text="⬅️ Back", callback_data="admin_payments_confirmed:0")
+    else:
+        b.button(text="⬅️ Back", callback_data="admin_payments_menu")
     b.adjust(2, 1)
     return b.as_markup()
 
@@ -1071,6 +1078,48 @@ async def cb_support(call: CallbackQuery, bot: Bot, m: Mongo):
     )
 
 
+@dp.callback_query(F.data == "menu_profile")
+async def cb_menu_profile(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    ok = await check_force_join(bot, call.from_user.id)
+    if not ok:
+        await edit_or_send(call, "🔒 Please join our channel to use the bot.", kb_force_join())
+        return
+
+    await call.answer()
+
+    # Get user data
+    user_id = call.from_user.id
+    u = await m.users.find_one({"_id": user_id})
+    
+    if not u:
+        await edit_or_send(call, "❌ User profile not found.", kb_back("home"))
+        return
+
+    # Get total orders
+    total_orders = await m.orders.count_documents({"user_id": user_id})
+    
+    username = u.get("username", "N/A") or "NoUsername"
+    balance_inr = u.get("balance_inr", 0)
+    balance_usd = balance_inr / config.USD_INR_RATE
+    
+    text = (
+        "👤 <b>My Profile</b>\n\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Username: @{username}\n"
+        f"💰 Total Wallet Balance: ₹{balance_inr} (${balance_usd:.2f})\n"
+        f"📦 Total Orders: <b>{total_orders}</b>"
+    )
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="home")]
+        ]
+    )
+    
+    await edit_or_send(call, text, kb)
+
+
 # -----------------------------
 # Add funds flow (user -> admin approval)
 # -----------------------------
@@ -1525,34 +1574,139 @@ async def cb_admin_home(call: CallbackQuery, bot: Bot, m: Mongo):
     await edit_or_send(call, "🛠 <b>Admin Panel</b>", kb_admin_home())
 
 
-@dp.callback_query(F.data == "admin_payments")
-async def cb_admin_payments(call: CallbackQuery, bot: Bot, m: Mongo):
+@dp.callback_query(F.data == "admin_payments_menu")
+async def cb_admin_payments_menu(call: CallbackQuery, bot: Bot, m: Mongo):
     await upsert_user(m, call)
     if not is_admin(call.from_user.id):
         await call.answer("No access", show_alert=True)
         return
 
-    pays = await m.payments.find({"status": "pending"}).sort("created_at", -1).limit(10).to_list(10)
+    # Get payment statistics
+    pending_count = await m.payments.count_documents({"status": "pending"})
+    confirmed_count = await m.payments.count_documents({"status": "approved"})
+    
+    # Calculate total payments amount
+    pipeline = [
+        {"$match": {"status": "approved"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount_inr"}}}
+    ]
+    result = await m.payments.aggregate(pipeline).to_list(1)
+    total_amount = int(result[0]["total"]) if result else 0
+
     await call.answer()
-    if not pays:
-        await edit_or_send(call, "⏳ No pending payments.", kb_admin_home())
+    
+    text = (
+        "💳 <b>Payments Overview</b>\n\n"
+        f"⏳ Pending Deposits: <b>{pending_count}</b>\n"
+        f"✅ Confirmed: <b>{confirmed_count}</b>\n"
+        f"💰 Total Payments: <b>₹{total_amount}</b>"
+    )
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⏳ Pending Deposits", callback_data="admin_payments_pending:0"),
+                InlineKeyboardButton(text="✅ Confirmed", callback_data="admin_payments_confirmed:0"),
+            ],
+            [InlineKeyboardButton(text="💰 Total Payments", callback_data="admin_payments_total")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="admin_home")],
+        ]
+    )
+    
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_payments_pending:"))
+async def cb_admin_payments_pending(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
         return
 
-    p = pays[0]
-    await _admin_show_payment(call, p)
+    page = int(call.data.split(":")[1])
+    per_page = 5
+    skip = page * per_page
+
+    pending_payments = await m.payments.find({"status": "pending"}).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    total_pending = await m.payments.count_documents({"status": "pending"})
+
+    await call.answer()
+    
+    if not pending_payments:
+        await edit_or_send(call, "⏳ No pending payments found.", kb_back("admin_payments_menu"))
+        return
+
+    text = f"⏳ <b>Pending Deposits</b> (Page {page + 1})\n\n"
+    
+    buttons = []
+    for p in pending_payments:
+        user_info = await m.users.find_one({"_id": p["user_id"]})
+        username = user_info.get("username", "N/A") if user_info else "N/A"
+        method = p.get("method", "N/A")
+        amount = p.get("amount_inr", 0)
+        payment_id = str(p["_id"])
+        
+        text += f"• User: @{username} | Method: {method} | ₹{amount}\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"@{username} - ₹{amount}",
+            callback_data=f"admin_payment_view:{payment_id}"
+        )])
+    
+    # Navigation buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_payments_pending:{page-1}"))
+    if skip + per_page < total_pending:
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_payments_pending:{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Payments", callback_data="admin_payments_menu")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
 
 
-async def _admin_show_payment(call: CallbackQuery, p: dict[str, Any]) -> None:
+@dp.callback_query(F.data.startswith("admin_payment_view:"))
+async def cb_admin_payment_view(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    payment_id = call.data.split(":", 1)[1]
+    oid = _to_object_id(payment_id)
+    p = await m.payments.find_one({"_id": oid})
+    
+    if not p:
+        await call.answer("Payment not found", show_alert=True)
+        return
+
+    await call.answer()
+    await _admin_show_payment(call, p, m)
+
+
+async def _admin_show_payment(call: CallbackQuery, p: dict[str, Any], m: Mongo = None) -> None:
     proof = "(no proof)"
     if p.get("proof_text"):
         proof = f"Text: <code>{p['proof_text']}</code>"
 
+    # Get username from database
+    username = "N/A"
+    if m:
+        user_info = await m.users.find_one({"_id": p["user_id"]})
+        if user_info:
+            username = user_info.get("username", "N/A") or "N/A"
+
     text = (
-        "💳 <b>Pending Payment</b>\n"
+        "💳 <b>Payment Details</b>\n"
         f"Payment ID: <code>{p['_id']}</code>\n"
-        f"User: <code>{p['user_id']}</code>\n"
+        f"User ID: <code>{p['user_id']}</code>\n"
+        f"Username: @{username}\n"
         f"Method: <b>{p.get('method','')}</b>\n"
         f"Amount: <b>₹{p.get('amount_inr',0)}</b>\n"
+        f"Status: <b>{p.get('status','pending')}</b>\n"
         f"Proof: {proof}"
     )
 
@@ -1560,11 +1714,96 @@ async def _admin_show_payment(call: CallbackQuery, p: dict[str, Any]) -> None:
         await edit_or_send(
             call,
             " ",
-            kb_admin_payment_review(str(p["_id"])),
+            kb_admin_payment_review(str(p["_id"]), p.get("status", "pending")),
             media=InputMediaPhoto(media=p["proof_photo"], caption=text, parse_mode=ParseMode.HTML),
         )
     else:
-        await edit_or_send(call, text, kb_admin_payment_review(str(p["_id"])))
+        await edit_or_send(call, text, kb_admin_payment_review(str(p["_id"]), p.get("status", "pending")))
+
+
+@dp.callback_query(F.data.startswith("admin_payments_confirmed:"))
+async def cb_admin_payments_confirmed(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    page = int(call.data.split(":")[1])
+    per_page = 5
+    skip = page * per_page
+
+    confirmed_payments = await m.payments.find({"status": "approved"}).sort("reviewed_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    total_confirmed = await m.payments.count_documents({"status": "approved"})
+
+    await call.answer()
+    
+    if not confirmed_payments:
+        await edit_or_send(call, "✅ No confirmed payments found.", kb_back("admin_payments_menu"))
+        return
+
+    text = f"✅ <b>Confirmed Payments</b> (Page {page + 1})\n\n"
+    
+    buttons = []
+    for p in confirmed_payments:
+        user_info = await m.users.find_one({"_id": p["user_id"]})
+        username = user_info.get("username", "N/A") if user_info else "N/A"
+        method = p.get("method", "N/A")
+        amount = p.get("amount_inr", 0)
+        payment_id = str(p["_id"])
+        
+        text += f"• User: @{username} | Method: {method} | ₹{amount}\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"@{username} - ₹{amount}",
+            callback_data=f"admin_payment_view:{payment_id}"
+        )])
+    
+    # Navigation buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_payments_confirmed:{page-1}"))
+    if skip + per_page < total_confirmed:
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_payments_confirmed:{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Payments", callback_data="admin_payments_menu")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_payments_total"))
+async def cb_admin_payments_total(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    # Calculate total payments statistics
+    pipeline = [
+        {"$match": {"status": "approved"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount_inr"}, "count": {"$sum": 1}}}
+    ]
+    result = await m.payments.aggregate(pipeline).to_list(1)
+    total_amount = int(result[0]["total"]) if result else 0
+    total_count = result[0]["count"] if result else 0
+
+    await call.answer()
+    
+    text = (
+        "💰 <b>Total Payments Summary</b>\n\n"
+        f"Total Transactions: <b>{total_count}</b>\n"
+        f"Total Amount: <b>₹{total_amount}</b>\n"
+    )
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Back to Payments", callback_data="admin_payments_menu")]
+        ]
+    )
+    
+    await edit_or_send(call, text, kb)
 
 
 @dp.callback_query(F.data.startswith("admin_pay:"))
@@ -1577,8 +1816,47 @@ async def cb_admin_pay_action(call: CallbackQuery, bot: Bot, m: Mongo):
     _, pid, action = call.data.split(":", 2)
     oid = _to_object_id(pid)
 
-    p = await m.payments.find_one({"_id": oid, "status": "pending"})
+    p = await m.payments.find_one({"_id": oid})
     if not p:
+        await call.answer("Payment not found", show_alert=True)
+        return
+
+    if action == "resend":
+        # Resend notification for approved payment
+        if p.get("status") != "approved":
+            await call.answer("Payment not approved", show_alert=True)
+            return
+        
+        try:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🛒 Buy Products", callback_data="menu_buy"),
+                        InlineKeyboardButton(text="💼 Wallet", callback_data="menu_wallet"),
+                    ]
+                ]
+            )
+            method_key = str(p.get("method", ""))
+            method_name = str(config.PAYMENTS.get(method_key, {}).get("name", method_key)).strip() or method_key
+            amount_inr = int(p.get("amount_inr", 0))
+            await bot.send_photo(
+                int(p["user_id"]),
+                photo=str(getattr(config, "START_IMAGE", "")),
+                caption=(
+                    f"✅ <b>Payment Approved (Resent)</b>\n"
+                    f"Method: <b>{method_name}</b>\n"
+                    f"Amount: <b>₹{amount_inr}</b>\n\n"
+                    f"Your wallet has been credited."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+            await call.answer("Notification resent to user!")
+        except Exception as e:
+            await call.answer(f"Failed to send: {e}", show_alert=True)
+        return
+
+    if p.get("status") != "pending":
         await call.answer("Already processed", show_alert=True)
         return
 
@@ -1868,16 +2146,158 @@ async def cb_admin_disc_for(call: CallbackQuery, m: Mongo):
     )
 
 
-@dp.callback_query(F.data == "admin_users")
-async def cb_admin_users(call: CallbackQuery, m: Mongo):
+@dp.callback_query(F.data == "admin_all_users")
+async def cb_admin_all_users(call: CallbackQuery, m: Mongo):
     await upsert_user(m, call)
     if not is_admin(call.from_user.id):
         await call.answer("No access", show_alert=True)
         return
 
-    await m.users.update_one({"_id": call.from_user.id}, {"$set": {"flow": {"type": "admin_user_lookup"}}})
     await call.answer()
-    await edit_or_send(call, "👤 Send target user ID (number).", kb_back("admin_home"))
+    
+    text = "👥 <b>All Users Management</b>\n\nSelect an option:"
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💵 Active Users", callback_data="admin_users_active:0")],
+            [InlineKeyboardButton(text="👁️ View All Users", callback_data="admin_users_view:0")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="admin_home")],
+        ]
+    )
+    
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_users_active:"))
+async def cb_admin_users_active(call: CallbackQuery, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    page = int(call.data.split(":")[1])
+    per_page = 5
+    skip = page * per_page
+
+    # Get users with balance > 0 (active cash)
+    users = await m.users.find({"balance_inr": {"$gt": 0}}).sort("balance_inr", -1).skip(skip).limit(per_page).to_list(per_page)
+    total_users = await m.users.count_documents({"balance_inr": {"$gt": 0}})
+
+    await call.answer()
+    
+    if not users:
+        await edit_or_send(call, "💵 No active users with balance found.", kb_back("admin_all_users"))
+        return
+
+    text = f"💵 <b>Active Users (Cash)</b> (Page {page + 1}/{(total_users + per_page - 1) // per_page})\n\n"
+    
+    for u in users:
+        user_id = u.get("_id", "N/A")
+        username = u.get("username", "N/A")
+        balance = u.get("balance_inr", 0)
+        text += f"• ID: <code>{user_id}</code> | @{username} | 💰 ${balance / config.USD_INR_RATE:.2f}\n"
+    
+    # Navigation buttons
+    buttons = []
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_users_active:{page-1}"))
+    if skip + per_page < total_users:
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_active:{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Users Menu", callback_data="admin_all_users")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_users_view:"))
+async def cb_admin_users_view(call: CallbackQuery, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    page = int(call.data.split(":")[1])
+    per_page = 5
+    skip = page * per_page
+
+    users = await m.users.find({}).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    total_users = await m.users.count_documents({})
+
+    await call.answer()
+    
+    if not users:
+        await edit_or_send(call, "👥 No users found.", kb_back("admin_all_users"))
+        return
+
+    text = f"👁️ <b>All Users</b> (Page {page + 1}/{(total_users + per_page - 1) // per_page})\n\n"
+    
+    buttons = []
+    for u in users:
+        user_id = u.get("_id", "N/A")
+        username = u.get("username", "N/A") or "NoUsername"
+        buttons.append([InlineKeyboardButton(
+            text=f"👤 @{username} - ID: {user_id}",
+            callback_data=f"admin_user_profile:{user_id}"
+        )])
+    
+    # Navigation buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_users_view:{page-1}"))
+    if skip + per_page < total_users:
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_view:{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Users Menu", callback_data="admin_all_users")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_user_profile:"))
+async def cb_admin_user_profile(call: CallbackQuery, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    user_id = int(call.data.split(":")[1])
+    u = await m.users.find_one({"_id": user_id})
+    
+    if not u:
+        await call.answer("User not found", show_alert=True)
+        return
+
+    # Get total orders
+    total_orders = await m.orders.count_documents({"user_id": user_id})
+    
+    username = u.get("username", "N/A") or "NoUsername"
+    balance_inr = u.get("balance_inr", 0)
+    balance_usd = balance_inr / config.USD_INR_RATE
+    banned = u.get("banned", False)
+    created_at = u.get("created_at", "N/A")
+
+    await call.answer()
+    
+    text = (
+        f"👤 <b>User Profile</b>\n\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Username: @{username}\n"
+        f"💰 Wallet: ₹{balance_inr} (${balance_usd:.2f})\n"
+        f"📦 Total Orders: <b>{total_orders}</b>\n"
+        f"🚫 Banned: <b>{banned}</b>\n"
+        f"📅 Joined: {created_at}"
+    )
+    
+    kb = kb_admin_user_actions(user_id, banned)
+    await edit_or_send(call, text, kb)
 
 
 def kb_admin_user_actions(target_id: int, banned: bool) -> InlineKeyboardMarkup:
