@@ -22,6 +22,7 @@ import asyncio
 import logging
 import re
 import httpx
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2685,15 +2686,18 @@ async def main() -> None:
 
     logger.info("Bot started as @%s", getattr(config, "BOT_USERNAME", ""))
 
-    # Polling mode only (webhooks handled via Cloudflare Worker)
-    await dp.start_polling(bot)
+    # Start FastAPI server in the same event loop
+    config_uvicorn = uvicorn.Config(api, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config_uvicorn)
+    api_task = asyncio.create_task(server.serve())
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        server.should_exit = True
+        with contextlib.suppress(Exception):
+            await api_task
 
 
 if __name__ == "__main__":
-    import threading
-
-    def run_api():
-        uvicorn.run(api, host="0.0.0.0", port=8000, log_level="info")
-
-    threading.Thread(target=run_api, daemon=True).start()
     asyncio.run(main())
