@@ -103,9 +103,22 @@ async def oxapay_confirm(req: Request):
         {"$set": {"status": "approved", "auto": True}},
     )
 
+    # Delete the payment link message if available
+    msg_id = payment.get("payment_message_id")
+    if msg_id:
+        with contextlib.suppress(Exception):
+            await bot_instance.delete_message(payment["user_id"], msg_id)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Buy Now", callback_data="menu_buy")]
+        ]
+    )
+
     await bot_instance.send_message(
         payment["user_id"],
         f"✅ Payment received!\n\n${float(payment.get('amount_usd', 0)):.2f} credited to your wallet.",
+        reply_markup=kb,
     )
 
     return {"ok": True}
@@ -183,11 +196,17 @@ async def handle_oxapay_payment(bot: Bot, m: Mongo, user_id: int, amount_usd: fl
             ]
         )
         
-        await bot.send_message(
+        payment_msg = await bot.send_message(
             user_id,
             text=text,
             parse_mode=ParseMode.HTML,
             reply_markup=kb
+        )
+
+        # Store message_id to delete later on confirmation
+        await m.payments.update_one(
+            {"oxapay_track_id": track_id},
+            {"$set": {"payment_message_id": payment_msg.message_id}}
         )
                 
     except Exception as e:
