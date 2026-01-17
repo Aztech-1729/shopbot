@@ -1731,10 +1731,10 @@ async def cb_admin_payments_menu(call: CallbackQuery, bot: Bot, m: Mongo):
     # Calculate total payments amount
     pipeline = [
         {"$match": {"status": "approved"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount_inr"}}}
+        {"$group": {"_id": None, "total": {"$sum": "$amount_usd"}}}
     ]
     result = await m.payments.aggregate(pipeline).to_list(1)
-    total_amount = int(result[0]["total"]) if result else 0
+    total_amount = float(result[0]["total"]) if result else 0.0
 
     await call.answer()
     
@@ -1742,7 +1742,7 @@ async def cb_admin_payments_menu(call: CallbackQuery, bot: Bot, m: Mongo):
         "💳 <b>Payments Overview</b>\n\n"
         f"⏳ Pending Deposits: <b>{pending_count}</b>\n"
         f"✅ Confirmed: <b>{confirmed_count}</b>\n"
-        f"💰 Total Payments: <b>₹{total_amount}</b>"
+        f"💰 Total Payments: <b>${total_amount:.2f}</b>"
     )
     
     kb = InlineKeyboardMarkup(
@@ -1786,12 +1786,12 @@ async def cb_admin_payments_pending(call: CallbackQuery, bot: Bot, m: Mongo):
         user_info = await m.users.find_one({"_id": p["user_id"]})
         username = user_info.get("username", "N/A") if user_info else "N/A"
         method = p.get("method", "N/A")
-        amount = p.get("amount_inr", 0)
+        amount = float(p.get("amount_usd", 0))
         payment_id = str(p["_id"])
         
-        text += f"• User: @{username} | Method: {method} | ₹{amount}\n"
+        text += f"• User: @{username} | Method: {method} | ${amount:.2f}\n"
         buttons.append([InlineKeyboardButton(
-            text=f"@{username} - ₹{amount}",
+            text=f"@{username} - ${amount:.2f}",
             callback_data=f"admin_payment_view:{payment_id}"
         )])
     
@@ -1848,7 +1848,7 @@ async def _admin_show_payment(call: CallbackQuery, p: dict[str, Any], m: Mongo =
         f"User ID: <code>{p['user_id']}</code>\n"
         f"Username: @{username}\n"
         f"Method: <b>{p.get('method','')}</b>\n"
-        f"Amount: <b>₹{p.get('amount_inr',0)}</b>\n"
+        f"Amount: <b>${float(p.get('amount_usd',0)):.2f}</b>\n"
         f"Status: <b>{p.get('status','pending')}</b>\n"
         f"Proof: {proof}"
     )
@@ -1891,12 +1891,12 @@ async def cb_admin_payments_confirmed(call: CallbackQuery, bot: Bot, m: Mongo):
         user_info = await m.users.find_one({"_id": p["user_id"]})
         username = user_info.get("username", "N/A") if user_info else "N/A"
         method = p.get("method", "N/A")
-        amount = p.get("amount_inr", 0)
+        amount = float(p.get("amount_usd", 0))
         payment_id = str(p["_id"])
         
-        text += f"• User: @{username} | Method: {method} | ₹{amount}\n"
+        text += f"• User: @{username} | Method: {method} | ${amount:.2f}\n"
         buttons.append([InlineKeyboardButton(
-            text=f"@{username} - ₹{amount}",
+            text=f"@{username} - ${amount:.2f}",
             callback_data=f"admin_payment_view:{payment_id}"
         )])
     
@@ -1926,10 +1926,10 @@ async def cb_admin_payments_total(call: CallbackQuery, bot: Bot, m: Mongo):
     # Calculate total payments statistics
     pipeline = [
         {"$match": {"status": "approved"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount_inr"}, "count": {"$sum": 1}}}
+        {"$group": {"_id": None, "total": {"$sum": "$amount_usd"}, "count": {"$sum": 1}}}
     ]
     result = await m.payments.aggregate(pipeline).to_list(1)
-    total_amount = int(result[0]["total"]) if result else 0
+    total_amount = float(result[0]["total"]) if result else 0.0
     total_count = result[0]["count"] if result else 0
 
     await call.answer()
@@ -1937,7 +1937,7 @@ async def cb_admin_payments_total(call: CallbackQuery, bot: Bot, m: Mongo):
     text = (
         "💰 <b>Total Payments Summary</b>\n\n"
         f"Total Transactions: <b>{total_count}</b>\n"
-        f"Total Amount: <b>₹{total_amount}</b>\n"
+        f"Total Amount: <b>${total_amount:.2f}</b>\n"
     )
     
     kb = InlineKeyboardMarkup(
@@ -2338,7 +2338,7 @@ async def cb_admin_users_active(call: CallbackQuery, m: Mongo):
         user_id = u.get("_id", "N/A")
         username = u.get("username", "N/A")
         balance = u.get("balance_inr", 0)
-        text += f"• ID: <code>{user_id}</code> | @{username} | 💰 ₹{int(balance)}\n"
+        text += f"• ID: <code>{user_id}</code> | @{username} | 💰 ${float(balance):.2f}\n"
     
     # Navigation buttons
     buttons = []
