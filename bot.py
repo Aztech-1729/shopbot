@@ -183,11 +183,14 @@ async def handle_oxapay_payment(bot: Bot, m: Mongo, user_id: int, amount_usd: fl
         
         # Send payment details with Pay Now, Verify, and Cancel buttons
         text = (
-            f"💳 <b>Payment Created</b>\n\n"
-            f"Amount: <b>${amount_usd:.2f}</b>\n"
-            f"Status: <b>Waiting for blockchain confirmation</b>\n\n"
-            f"⚡ Payment will be credited automatically.\n"
-            f"No verification needed."
+            f"💳 <b>Crypto Payment Created</b>\n\n"
+            f"Amount: <b>${amount_usd:.2f} USD</b>\n"
+            f"Status: <b>Awaiting blockchain confirmation</b>\n\n"
+            f"⚡ <b>Automatic Processing:</b>\n"
+            f"• Payment will be detected instantly\n"
+            f"• Wallet credited automatically upon confirmation\n"
+            f"• No manual verification required\n\n"
+            f"Your funds will appear in your wallet within minutes."
         )
         
         kb = InlineKeyboardMarkup(
@@ -220,7 +223,7 @@ async def handle_oxapay_payment(bot: Bot, m: Mongo, user_id: int, amount_usd: fl
 
 
 def money_int(amount: str) -> int:
-    """Parse user-entered amount to integer INR."""
+    """Parse user-entered amount to integer USD."""
     try:
         dec = Decimal(str(amount).strip())
     except (InvalidOperation, AttributeError):
@@ -375,7 +378,7 @@ async def upsert_user(m: Mongo, update_from: Message | CallbackQuery) -> dict[st
                 "user_id": u.id,
                 "created_at": now,
                 "balance_inr": 0,
-                "currency": "INR",
+                "currency": "USD",
                 "banned": False,
             },
             "$set": {
@@ -879,7 +882,7 @@ async def cb_category(call: CallbackQuery, bot: Bot, m: Mongo):
     cat_id = call.data.split(":", 1)[1]
     products = await m.products.find({"category_id": cat_id, "enabled": True}).sort("name", 1).to_list(500)
     user = await m.users.find_one({"_id": call.from_user.id})
-    currency = str((user or {}).get("currency", "INR")).upper()
+    currency = "USD"
 
     await call.answer()
     if not products:
@@ -1385,7 +1388,7 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
                 await edit_ui_for_user(bot, m, message.from_user.id, "❌ Invalid amount. Send a number like 0.1 or 5 or 10.50")
                 return
         
-        # Handle other payment methods (UPI, etc.) with INR amount
+        # Handle other payment methods (UPI, etc.) with USD amount
         try:
             amount = money_int(message.text)
         except ValueError:
@@ -1413,7 +1416,7 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
             bot,
             m,
             message.from_user.id,
-            f"✅ Amount saved: <b>₹{amount}</b>\nNow send <b>payment screenshot only</b> (photo).",
+            f"💵 Amount saved: <b>${amount}</b>\nNow send <b>payment screenshot only</b> (photo).",
             kb_back("menu_addfunds"),
         )
         return
