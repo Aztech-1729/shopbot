@@ -1058,6 +1058,7 @@ async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty
             await m.orders.insert_one(
                 {
                     "_id": order_id,
+                    "order_id": str(order_id),
                     "user_id": user_id,
                     "product_id": prod["_id"],
                     "product_name": prod["name"],
@@ -2926,9 +2927,8 @@ async def main() -> None:
 
     await ensure_indexes(m)
 
-    # Repair legacy docs for DBs that enforce uniqueness on `payment_id`.
-    # If any payment docs were created without payment_id, they will have null/missing value
-    # and a unique index will crash subsequent inserts.
+    # Repair legacy docs for DBs that enforce uniqueness on `payment_id` / `order_id`.
+    # If any docs were created without these fields, they may be null/missing and unique indexes can crash inserts.
     try:
         await m.payments.update_many(
             {"payment_id": {"$exists": False}},
@@ -2937,6 +2937,15 @@ async def main() -> None:
         await m.payments.update_many(
             {"payment_id": None},
             [{"$set": {"payment_id": {"$toString": "$_id"}}}],
+        )
+
+        await m.orders.update_many(
+            {"order_id": {"$exists": False}},
+            [{"$set": {"order_id": {"$toString": "$_id"}}}],
+        )
+        await m.orders.update_many(
+            {"order_id": None},
+            [{"$set": {"order_id": {"$toString": "$_id"}}}],
         )
     except Exception:
         # If pipeline updates are unsupported, ignore (new inserts are fixed anyway).
