@@ -572,7 +572,7 @@ def kb_admin_home() -> InlineKeyboardMarkup:
     b.button(text="💳 Payments", callback_data="admin_payments_menu")
     b.button(text="📦 Products", callback_data="admin_products")
     b.button(text="📥 Add Stock", callback_data="admin_stock")
-    b.button(text="📋 Stocks Added", callback_data="admin_stocks_menu")
+    b.button(text="📋 ALL Stocks", callback_data="admin_stocks_menu")
     b.button(text="🏷 Discounts", callback_data="admin_discounts")
     b.button(text="👥 All Users", callback_data="admin_all_users")
     b.button(text="⬅️ Back", callback_data="home")
@@ -727,7 +727,13 @@ async def edit_ui_message(
         caption=text,
         parse_mode=ParseMode.HTML,
     )
-    await bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media, reply_markup=reply_markup)
+    try:
+        await bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        # Ignore "message is not modified" errors (user clicked same button twice)
+        if "message is not modified" in str(e).lower():
+            return
+        raise
 
 
 async def edit_ui_from_call(
@@ -1252,16 +1258,16 @@ async def cb_order_view(call: CallbackQuery, bot: Bot, m: Mongo):
         f"Product: <b>{product_name}</b>\n"
         f"Quantity: <b>{qty}</b>\n"
         f"Amount: <b>${total_usd:.2f}</b>\n"
-        f"Status: <b>{status}</b>\n"
         f"Date: {date_str}\n"
         f"Order ID: <code>{order_id}</code>"
     )
     
-    # Show delivered items if available
-    if status == "delivered" and order.get("items"):
+    # Show delivered credentials if available
+    if order.get("delivered"):
         text += "\n\n<b>Account Details:</b>\n"
-        for item in order["items"]:
-            text += f"<code>{item}</code>\n"
+        for i, item in enumerate(order["delivered"], 1):
+            # item is like "Email: x\nPassword: y"
+            text += f"<b>{i}.</b> <code>{item}</code>\n\n"
     
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1319,8 +1325,17 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot, m: Mongo):
 
     # Calculate total spent
     pipeline = [
-        {"$match": {"user_id": user_id, "status": "delivered"}},
-        {"$group": {"_id": None, "total": {"$sum": "$total_usd"}}}
+        {"$match": {"user_id": user_id}},
+        {
+            "$group": {
+                "_id": None,
+                "total": {
+                    "$sum": {
+                        "$ifNull": ["$total_usd", {"$ifNull": ["$total_inr", 0]}]
+                    }
+                },
+            }
+        },
     ]
     result = await m.orders.aggregate(pipeline).to_list(1)
     total_spent = float(result[0]["total"]) if result else 0.0
@@ -1627,18 +1642,18 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
         op = flow.get("op")
         delta = amt if op == "addbal" else -amt
 
-        await m.users.update_one({"_id": target_id}, {"$inc": {"balance_inr": int(delta)}})
+        await m.users.update_one({"_id": target_id}, {"$inc": {"balance_inr": float(delta)}})
         await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": None}})
-        await admin_log(m, message.from_user.id, "user_balance_adjust", {"target_id": target_id, "delta": int(delta)})
+        await admin_log(m, message.from_user.id, "user_balance_adjust", {"target_id": target_id, "delta": float(delta)})
 
         u = await m.users.find_one({"_id": target_id})
-        bal = int((u or {}).get("balance_inr", 0))
+        bal = float((u or {}).get("balance_inr", 0))
         banned = bool((u or {}).get("banned", False))
         await edit_ui_for_user(
             bot,
             m,
             message.from_user.id,
-            f"✅ Updated.\nUser: <code>{target_id}</code>\nBalance: <b>₹{bal}</b>",
+            f"✅ Updated.\nUser: <code>{target_id}</code>\nBalance: <b>${bal:.2f}</b>",
             kb_admin_user_actions(target_id, banned),
         )
         return
@@ -1675,7 +1690,25 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
         await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": None}})
         await admin_log(m, message.from_user.id, "stock_added", {"product_id": pid, "email": email})
 
-        await edit_ui_for_user(bot, m, message.from_user.id, f"✅ Stock added!\n\n📧 {email}\n🔑 {password}", kb_back("admin_home"))
+        await edit_ui_for_user(bot, m, message.from_user.id, f"✅ Stock added!\n\nEmail: {email}\nPassword: {password}", kb_back("admin_home"))
+        return
+
+    if ftype == "await_stock_edit_email" and is_admin(message.from_user.id):
+        new_email = message.text.strip()
+        stock_id = flow.get("stock_id")
+        oid = _to_object_id(stock_id)
+        await m.stocks.update_one({"_id": oid}, {"$set": {"email": new_email}})
+        await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": None}})
+        await edit_ui_for_user(bot, m, message.from_user.id, "✅ Email updated.", kb_back("admin_stocks_menu"))
+        return
+
+    if ftype == "await_stock_edit_pass" and is_admin(message.from_user.id):
+        new_pass = message.text.strip()
+        stock_id = flow.get("stock_id")
+        oid = _to_object_id(stock_id)
+        await m.stocks.update_one({"_id": oid}, {"$set": {"password": new_pass}})
+        await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": None}})
+        await edit_ui_for_user(bot, m, message.from_user.id, "✅ Password updated.", kb_back("admin_stocks_menu"))
         return
 
     if ftype == "admin_prod_edit" and is_admin(message.from_user.id):
@@ -1724,8 +1757,7 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
             f"ID: <code>{p['_id']}</code>\n"
             f"Name: <b>{p.get('name','')}</b>\n"
             f"Category: <code>{p.get('category_id','')}</code>\n"
-            f"INR: <b>₹{p.get('price_inr',0)}</b>\n"
-            f"USD: <b>${p.get('price_usd',0)}</b>\n"
+            f"USD: <b>${p.get('price_usd', p.get('price_inr',0))}</b>\n"
             f"Enabled: <b>{bool(p.get('enabled', True))}</b>"
         )
         await edit_ui_for_user(bot, m, message.from_user.id, txt, kb_admin_product_editor(str(p["_id"]), bool(p.get("enabled", True))))
@@ -1745,24 +1777,11 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
                 return
             await m.users.update_one(
                 {"_id": message.from_user.id},
-                {"$set": {"flow": {"type": "admin_prod_add", "step": "inr", "category_id": cat_id, "name": name}}},
-            )
-            await edit_ui_for_user(bot, m, message.from_user.id, "➕ Send INR price", kb_back("admin_products"))
-            return
-
-        if step == "inr":
-            try:
-                price_inr = int(Decimal(message.text.strip()))
-            except Exception:
-                await edit_ui_for_user(bot, m, message.from_user.id, "Invalid INR price")
-                return
-            name = str(flow.get("name") or "").strip()
-            await m.users.update_one(
-                {"_id": message.from_user.id},
-                {"$set": {"flow": {"type": "admin_prod_add", "step": "usd", "category_id": cat_id, "name": name, "price_inr": price_inr}}},
+                {"$set": {"flow": {"type": "admin_prod_add", "step": "usd", "category_id": cat_id, "name": name}}},
             )
             await edit_ui_for_user(bot, m, message.from_user.id, "➕ Send USD price", kb_back("admin_products"))
             return
+
 
         if step == "usd":
             try:
@@ -1772,13 +1791,11 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
                 return
 
             name = str(flow.get("name") or "").strip()
-            price_inr = int(flow.get("price_inr") or 0)
-
             doc = {
                 "_id": ObjectId(),
                 "category_id": cat_id,
                 "name": name,
-                "price_inr": price_inr,
+                "price_inr": 0,
                 "price_usd": float(price_usd),
                 "enabled": True,
                 "created_at": utcnow(),
@@ -2221,7 +2238,6 @@ def kb_admin_product_editor(prod_id: str, enabled: bool) -> InlineKeyboardMarkup
     b = InlineKeyboardBuilder()
     b.button(text=("⛔ Disable" if enabled else "✅ Enable"), callback_data=f"admin_prod_toggle:{prod_id}")
     b.button(text="✏️ Edit Name", callback_data=f"admin_prod_edit:{prod_id}:name")
-    b.button(text="💴 Edit INR", callback_data=f"admin_prod_edit:{prod_id}:inr")
     b.button(text="💵 Edit USD", callback_data=f"admin_prod_edit:{prod_id}:usd")
     b.button(text="🗑 Delete", callback_data=f"admin_prod_delete:{prod_id}")
     b.button(text="⬅️ Back", callback_data="admin_products")
@@ -2585,7 +2601,7 @@ async def cb_admin_user_action(call: CallbackQuery, m: Mongo):
         bal = int((u or {}).get("balance_inr", 0))
         await edit_or_send(
             call,
-            f"👤 User: <code>{target_id}</code>\nBanned: <b>{bool((u or {}).get('banned', False))}</b>\nBalance: <b>₹{bal}</b>",
+            f"👤 User: <code>{target_id}</code>\nBanned: <b>{bool((u or {}).get('banned', False))}</b>\nBalance: <b>${float(bal):.2f}</b>",
             kb_admin_user_actions(target_id, bool((u or {}).get("banned", False))),
         )
         return
@@ -2596,7 +2612,7 @@ async def cb_admin_user_action(call: CallbackQuery, m: Mongo):
             {"$set": {"flow": {"type": "admin_user_balance", "target_id": target_id, "op": action}}},
         )
         await call.answer()
-        await edit_or_send(call, "Send amount (INR) as a number.", kb_back("admin_home"))
+        await edit_or_send(call, "Send amount in USD (e.g., 10.50)", kb_back("admin_home"))
         return
 
 
@@ -2682,7 +2698,7 @@ async def cb_admin_stocks_page(call: CallbackQuery, bot: Bot, m: Mongo, page: in
     skip = page * per_page
     page_products = products[skip:skip+per_page]
     
-    text = f"📋 <b>Stocks Added</b> (Page {page + 1}/{(len(products) + per_page - 1) // per_page})\n\n"
+    text = f"📋 <b>ALL Stocks</b> (Page {page + 1}/{(len(products) + per_page - 1) // per_page})\n\nChoose a product to manage stocks:"
     
     buttons = []
     for p in page_products:
@@ -2723,26 +2739,19 @@ async def cb_admin_stocks_view(call: CallbackQuery, bot: Bot, m: Mongo):
         await call.answer("Product not found", show_alert=True)
         return
     
-    stocks = await m.stocks.find({"product_id": oid}).sort("created_at", -1).to_list(50)
-    
     await call.answer()
-    
-    text = f"📋 <b>Stocks for: {product['name']}</b>\n\n"
-    
-    buttons = []
-    for idx, stock in enumerate(stocks, 1):
-        status = stock.get("status", "available")
-        emoji = "✅" if status == "available" else "❌"
-        email = stock.get("email", "N/A")
-        buttons.append([InlineKeyboardButton(
-            text=f"{emoji} {email}",
-            callback_data=f"admin_stock_edit:{stock['_id']}"
-        )])
-    
-    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="admin_stocks_menu")])
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await edit_or_send(call, text, kb)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Available Stocks", callback_data=f"admin_stocks_list:{pid}:available:0"),
+                InlineKeyboardButton(text="❌ Sold Stocks", callback_data=f"admin_stocks_list:{pid}:sold:0"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="admin_stocks_menu")],
+        ]
+    )
+
+    await edit_or_send(call, f"📋 <b>ALL Stocks</b>\n\nProduct: <b>{product['name']}</b>\n\nChoose a category:", kb)
 
 
 @dp.callback_query(F.data.startswith("admin_stock_edit:"))
@@ -2775,8 +2784,10 @@ async def cb_admin_stock_edit(call: CallbackQuery, bot: Bot, m: Mongo):
     
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Edit Email", callback_data=f"admin_stock_edit_email:{stock_id}")],
+            [InlineKeyboardButton(text="✏️ Edit Password", callback_data=f"admin_stock_edit_pass:{stock_id}")],
             [InlineKeyboardButton(text="🗑 Delete", callback_data=f"admin_stock_delete:{stock_id}")],
-            [InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_stocks_view:{stock.get('product_id')}")]
+            [InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_stocks_view:{stock.get('product_id')}")],
         ]
     )
     
@@ -2789,22 +2800,100 @@ async def cb_admin_stock_delete(call: CallbackQuery, bot: Bot, m: Mongo):
     if not is_admin(call.from_user.id):
         await call.answer("No access", show_alert=True)
         return
-    
+
     stock_id = call.data.split(":", 1)[1]
     oid = _to_object_id(stock_id)
-    
+
     stock = await m.stocks.find_one({"_id": oid})
     if not stock:
         await call.answer("Stock not found", show_alert=True)
         return
-    
-    product_id = stock.get("product_id")
+
     await m.stocks.delete_one({"_id": oid})
-    
+
     await call.answer("✅ Deleted")
-    
-    # Redirect back to product stocks
+
+    # Back to product menu
     await cb_admin_stocks_view(call, bot, m)
+
+
+@dp.callback_query(F.data.startswith("admin_stocks_list:"))
+async def cb_admin_stocks_list(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    _, pid, status, page_s = call.data.split(":", 3)
+    page = int(page_s)
+    oid = _to_object_id(pid)
+
+    product = await m.products.find_one({"_id": oid})
+    if not product:
+        await call.answer("Product not found", show_alert=True)
+        return
+
+    per_page = 5
+    skip = page * per_page
+
+    q = {"product_id": oid, "status": status}
+    stocks = await m.stocks.find(q).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    total = await m.stocks.count_documents(q)
+
+    await call.answer()
+
+    title = "✅ Available Stocks" if status == "available" else "❌ Sold Stocks"
+    text = f"📋 <b>{title}</b>\nProduct: <b>{product['name']}</b>\nPage {page+1}/{(total+per_page-1)//per_page}\n\n"
+
+    buttons = []
+    for s in stocks:
+        email = s.get("email", "")
+        if status == "sold":
+            buyer = await m.users.find_one({"_id": s.get("sold_to")})
+            buyer_name = (buyer or {}).get("username") or str(s.get("sold_to"))
+            sold_at = s.get("sold_at")
+            sold_at_str = sold_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(sold_at, "strftime") else str(sold_at)
+            buttons.append([InlineKeyboardButton(text=f"{email} • @{buyer_name}", callback_data=f"admin_stock_edit:{s['_id']}" )])
+        else:
+            buttons.append([InlineKeyboardButton(text=email or "(no email)", callback_data=f"admin_stock_edit:{s['_id']}" )])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_stocks_list:{pid}:{status}:{page-1}"))
+    if skip + per_page < total:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_stocks_list:{pid}:{status}:{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_stocks_view:{pid}")])
+
+    await edit_or_send(call, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("admin_stock_edit_email:"))
+async def cb_admin_stock_edit_email(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    stock_id = call.data.split(":", 1)[1]
+    await m.users.update_one({"_id": call.from_user.id}, {"$set": {"flow": {"type": "await_stock_edit_email", "stock_id": stock_id}}})
+    await call.answer()
+    await edit_or_send(call, "✏️ Send new <b>Email</b>:", kb_back("admin_home"))
+
+
+@dp.callback_query(F.data.startswith("admin_stock_edit_pass:"))
+async def cb_admin_stock_edit_pass(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+
+    stock_id = call.data.split(":", 1)[1]
+    await m.users.update_one({"_id": call.from_user.id}, {"$set": {"flow": {"type": "await_stock_edit_pass", "stock_id": stock_id}}})
+    await call.answer()
+    await edit_or_send(call, "✏️ Send new <b>Password</b>:", kb_back("admin_home"))
 
 
 # -----------------------------
