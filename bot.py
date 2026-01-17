@@ -572,10 +572,11 @@ def kb_admin_home() -> InlineKeyboardMarkup:
     b.button(text="💳 Payments", callback_data="admin_payments_menu")
     b.button(text="📦 Products", callback_data="admin_products")
     b.button(text="📥 Add Stock", callback_data="admin_stock")
+    b.button(text="📋 Stocks Added", callback_data="admin_stocks_menu")
     b.button(text="🏷 Discounts", callback_data="admin_discounts")
     b.button(text="👥 All Users", callback_data="admin_all_users")
     b.button(text="⬅️ Back", callback_data="home")
-    b.adjust(2, 2, 1)
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
 
@@ -1135,25 +1136,119 @@ async def cb_confirm(call: CallbackQuery, bot: Bot, m: Mongo):
 
 @dp.callback_query(F.data == "menu_orders")
 async def cb_orders(call: CallbackQuery, bot: Bot, m: Mongo):
+    await call.answer()
+    await cb_orders_page(call, bot, m, 0)
+
+
+@dp.callback_query(F.data.startswith("orders_page:"))
+async def cb_orders_page_handler(call: CallbackQuery, bot: Bot, m: Mongo):
+    await call.answer()
+    page = int(call.data.split(":")[1])
+    await cb_orders_page(call, bot, m, page)
+
+
+async def cb_orders_page(call: CallbackQuery, bot: Bot, m: Mongo, page: int):
     await upsert_user(m, call)
     ok = await check_force_join(bot, call.from_user.id)
     if not ok:
         await edit_or_send(call, "🔒 Please join our channel to use the bot.", kb_force_join())
         return
 
-    orders = await m.orders.find({"user_id": call.from_user.id}).sort("created_at", -1).limit(10).to_list(10)
-    await call.answer()
+    per_page = 5
+    skip = page * per_page
+    
+    orders = await m.orders.find({"user_id": call.from_user.id}).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    total_orders = await m.orders.count_documents({"user_id": call.from_user.id})
+    
     if not orders:
         await edit_or_send(call, "📦 <b>My Orders</b>\nNo orders yet.", kb_back("home"))
         return
 
-    lines = ["📦 <b>My Orders</b>"]
+    text = f"📦 <b>My Orders</b> (Page {page + 1}/{(total_orders + per_page - 1) // per_page})\n\nClick on an order to view details:"
+    
+    buttons = []
     for o in orders:
-        total_usd = float(o.get("total_usd", o.get("total_inr", 0)))
-        lines.append(
-            f"\n<b>{o.get('product_name','')}</b> x{o.get('qty',1)} — ${total_usd:.2f}\nID: <code>{o['_id']}</code>"
-        )
-    await edit_or_send(call, "\n".join(lines), kb_back("home"))
+        product_name = o.get('product_name', 'Unknown')
+        qty = o.get('qty', 1)
+        order_id = str(o['_id'])
+        buttons.append([InlineKeyboardButton(
+            text=f"{product_name} x{qty}",
+            callback_data=f"order_view:{order_id}"
+        )])
+    
+    # Navigation buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"orders_page:{page-1}"))
+    if skip + per_page < total_orders:
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"orders_page:{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="home")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("order_view:"))
+async def cb_order_view(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    ok = await check_force_join(bot, call.from_user.id)
+    if not ok:
+        await edit_or_send(call, "🔒 Please join our channel to use the bot.", kb_force_join())
+        return
+
+    order_id = call.data.split(":", 1)[1]
+    oid = _to_object_id(order_id)
+    order = await m.orders.find_one({"_id": oid})
+    
+    if not order:
+        await call.answer("Order not found", show_alert=True)
+        return
+    
+    if order["user_id"] != call.from_user.id:
+        await call.answer("Not your order", show_alert=True)
+        return
+
+    await call.answer()
+    
+    product_name = order.get('product_name', 'Unknown')
+    qty = order.get('qty', 1)
+    total_usd = float(order.get('total_usd', order.get('total_inr', 0)))
+    status = order.get('status', 'unknown')
+    created_at = order.get('created_at', 'N/A')
+    
+    # Format date
+    if hasattr(created_at, 'strftime'):
+        date_str = created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    else:
+        date_str = str(created_at)
+    
+    text = (
+        f"📦 <b>Order Details</b>\n\n"
+        f"Product: <b>{product_name}</b>\n"
+        f"Quantity: <b>{qty}</b>\n"
+        f"Amount: <b>${total_usd:.2f}</b>\n"
+        f"Status: <b>{status}</b>\n"
+        f"Date: {date_str}\n"
+        f"Order ID: <code>{order_id}</code>"
+    )
+    
+    # Show delivered items if available
+    if status == "delivered" and order.get("items"):
+        text += "\n\n<b>Your Items:</b>\n"
+        for item in order["items"]:
+            text += f"<code>{item}</code>\n"
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Back to Orders", callback_data="menu_orders")]
+        ]
+    )
+    
+    await edit_or_send(call, text, kb)
 
 
 @dp.callback_query(F.data == "menu_support")
@@ -1201,11 +1296,20 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot, m: Mongo):
     username = u.get("username", "N/A") or "NoUsername"
     balance_inr = u.get("balance_inr", 0)
 
+    # Calculate total spent
+    pipeline = [
+        {"$match": {"user_id": user_id, "status": "delivered"}},
+        {"$group": {"_id": None, "total": {"$sum": "$total_usd"}}}
+    ]
+    result = await m.orders.aggregate(pipeline).to_list(1)
+    total_spent = float(result[0]["total"]) if result else 0.0
+
     text = (
         "👤 <b>My Profile</b>\n\n"
         f"User ID: <code>{user_id}</code>\n"
         f"Username: @{username}\n"
         f"💰 Total Wallet Balance: ${float(balance_inr):.2f}\n"
+        f"💳 Total Spent: ${total_spent:.2f}\n"
         f"📦 Total Orders: <b>{total_orders}</b>"
     )
     
@@ -1529,6 +1633,41 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
             f"✅ Updated.\nUser: <code>{target_id}</code>\nBalance: <b>₹{bal}</b>",
             kb_admin_user_actions(target_id, banned),
         )
+        return
+
+    if ftype == "await_stock_email" and is_admin(message.from_user.id):
+        email = message.text.strip()
+        if not email:
+            await edit_ui_for_user(bot, m, message.from_user.id, "Invalid email")
+            return
+
+        pid = flow.get("product_id")
+        await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": {"type": "await_stock_password", "product_id": pid, "email": email}}})
+        await edit_ui_for_user(bot, m, message.from_user.id, "🔑 Now send the <b>password</b>:", kb_back("admin_stock"))
+        return
+
+    if ftype == "await_stock_password" and is_admin(message.from_user.id):
+        password = message.text.strip()
+        if not password:
+            await edit_ui_for_user(bot, m, message.from_user.id, "Invalid password")
+            return
+
+        pid = flow.get("product_id")
+        email = flow.get("email")
+        oid = _to_object_id(pid)
+
+        await m.stocks.insert_one({
+            "product_id": oid,
+            "email": email,
+            "password": password,
+            "status": "available",
+            "created_at": utcnow()
+        })
+
+        await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": None}})
+        await admin_log(m, message.from_user.id, "stock_added", {"product_id": pid, "email": email})
+
+        await edit_ui_for_user(bot, m, message.from_user.id, f"✅ Stock added!\n\n📧 {email}\n🔑 {password}", kb_back("admin_home"))
         return
 
     if ftype == "admin_prod_edit" and is_admin(message.from_user.id):
@@ -1973,10 +2112,7 @@ async def cb_admin_pay_action(call: CallbackQuery, bot: Bot, m: Mongo):
         try:
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="🛒 Buy Products", callback_data="menu_buy"),
-                        InlineKeyboardButton(text="💼 Wallet", callback_data="menu_wallet"),
-                    ]
+                    [InlineKeyboardButton(text="🛒 Buy Products", callback_data="menu_buy")]
                 ]
             )
             method_key = str(p.get("method", ""))
@@ -2487,6 +2623,213 @@ async def cb_admin_user_action(call: CallbackQuery, m: Mongo):
         await call.answer()
         await edit_or_send(call, "Send amount (INR) as a number.", kb_back("admin_home"))
         return
+
+
+# -----------------------------
+# Admin Stock Management
+# -----------------------------
+
+
+@dp.callback_query(F.data == "admin_stock")
+async def cb_admin_stock(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    prods = await m.products.find({}).to_list(100)
+    await call.answer()
+    
+    if not prods:
+        await edit_or_send(call, "No products. Create one first.", kb_back("admin_home"))
+        return
+    
+    b = InlineKeyboardBuilder()
+    for p in prods:
+        b.button(text=p["name"], callback_data=f"admin_stock_prod:{p['_id']}")
+    b.button(text="⬅️ Back", callback_data="admin_home")
+    b.adjust(1)
+    
+    await edit_or_send(call, "📥 <b>Add Stock</b>\n\nSelect product:", b.as_markup())
+
+
+@dp.callback_query(F.data.startswith("admin_stock_prod:"))
+async def cb_admin_stock_prod(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    pid = call.data.split(":", 1)[1]
+    await m.users.update_one({"_id": call.from_user.id}, {"$set": {"flow": {"type": "await_stock_email", "product_id": pid}}})
+    
+    await call.answer()
+    await edit_or_send(call, "📧 Send the <b>email/gmail</b> for this stock item:", kb_back("admin_stock"))
+
+
+@dp.callback_query(F.data == "admin_stocks_menu")
+async def cb_admin_stocks_menu(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    await call.answer()
+    await cb_admin_stocks_page(call, bot, m, 0)
+
+
+@dp.callback_query(F.data.startswith("admin_stocks_page:"))
+async def cb_admin_stocks_page_handler(call: CallbackQuery, bot: Bot, m: Mongo):
+    await call.answer()
+    page = int(call.data.split(":")[1])
+    await cb_admin_stocks_page(call, bot, m, page)
+
+
+async def cb_admin_stocks_page(call: CallbackQuery, bot: Bot, m: Mongo, page: int):
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    # Get products with stock counts
+    pipeline = [
+        {"$lookup": {"from": "stocks", "localField": "_id", "foreignField": "product_id", "as": "stocks"}},
+        {"$addFields": {"stock_count": {"$size": "$stocks"}}},
+        {"$match": {"stock_count": {"$gt": 0}}}
+    ]
+    
+    products = await m.products.aggregate(pipeline).to_list(100)
+    
+    if not products:
+        await edit_or_send(call, "📋 <b>Stocks Added</b>\n\nNo stocks found.", kb_back("admin_home"))
+        return
+    
+    per_page = 5
+    skip = page * per_page
+    page_products = products[skip:skip+per_page]
+    
+    text = f"📋 <b>Stocks Added</b> (Page {page + 1}/{(len(products) + per_page - 1) // per_page})\n\n"
+    
+    buttons = []
+    for p in page_products:
+        stock_count = p.get("stock_count", 0)
+        buttons.append([InlineKeyboardButton(
+            text=f"{p['name']} ({stock_count} stocks)",
+            callback_data=f"admin_stocks_view:{p['_id']}"
+        )])
+    
+    # Navigation
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin_stocks_page:{page-1}"))
+    if skip + per_page < len(products):
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_stocks_page:{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="admin_home")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_stocks_view:"))
+async def cb_admin_stocks_view(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    pid = call.data.split(":", 1)[1]
+    oid = _to_object_id(pid)
+    
+    product = await m.products.find_one({"_id": oid})
+    if not product:
+        await call.answer("Product not found", show_alert=True)
+        return
+    
+    stocks = await m.stocks.find({"product_id": oid}).sort("created_at", -1).to_list(50)
+    
+    await call.answer()
+    
+    text = f"📋 <b>Stocks for: {product['name']}</b>\n\n"
+    
+    buttons = []
+    for idx, stock in enumerate(stocks, 1):
+        status = stock.get("status", "available")
+        emoji = "✅" if status == "available" else "❌"
+        email = stock.get("email", "N/A")
+        buttons.append([InlineKeyboardButton(
+            text=f"{emoji} {email}",
+            callback_data=f"admin_stock_edit:{stock['_id']}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="admin_stocks_menu")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_stock_edit:"))
+async def cb_admin_stock_edit(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    stock_id = call.data.split(":", 1)[1]
+    oid = _to_object_id(stock_id)
+    
+    stock = await m.stocks.find_one({"_id": oid})
+    if not stock:
+        await call.answer("Stock not found", show_alert=True)
+        return
+    
+    await call.answer()
+    
+    email = stock.get("email", "N/A")
+    password = stock.get("password", "N/A")
+    status = stock.get("status", "available")
+    
+    text = (
+        f"📧 <b>Stock Item</b>\n\n"
+        f"Email: <code>{email}</code>\n"
+        f"Password: <code>{password}</code>\n"
+        f"Status: <b>{status}</b>"
+    )
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Delete", callback_data=f"admin_stock_delete:{stock_id}")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data=f"admin_stocks_view:{stock.get('product_id')}")]
+        ]
+    )
+    
+    await edit_or_send(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("admin_stock_delete:"))
+async def cb_admin_stock_delete(call: CallbackQuery, bot: Bot, m: Mongo):
+    await upsert_user(m, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("No access", show_alert=True)
+        return
+    
+    stock_id = call.data.split(":", 1)[1]
+    oid = _to_object_id(stock_id)
+    
+    stock = await m.stocks.find_one({"_id": oid})
+    if not stock:
+        await call.answer("Stock not found", show_alert=True)
+        return
+    
+    product_id = stock.get("product_id")
+    await m.stocks.delete_one({"_id": oid})
+    
+    await call.answer("✅ Deleted")
+    
+    # Redirect back to product stocks
+    await cb_admin_stocks_view(call, bot, m)
 
 
 # -----------------------------
