@@ -95,7 +95,7 @@ async def oxapay_confirm(req: Request):
 
     await mongo.users.update_one(
         {"_id": payment["user_id"]},
-        {"$inc": {"balance_inr": int(payment.get("amount_inr", 0))}},
+        {"$inc": {"balance_inr": float(payment.get("amount_usd", 0))}},
     )
 
     await mongo.payments.update_one(
@@ -105,7 +105,7 @@ async def oxapay_confirm(req: Request):
 
     await bot_instance.send_message(
         payment["user_id"],
-        f"✅ Payment received!\n\n₹{int(payment.get('amount_inr', 0))} credited to your wallet.",
+        f"✅ Payment received!\n\n${float(payment.get('amount_usd', 0)):.2f} credited to your wallet.",
     )
 
     return {"ok": True}
@@ -150,10 +150,6 @@ async def handle_oxapay_payment(bot: Bot, m: Mongo, user_id: int, amount_usd: fl
         track_id = payment_result.get("track_id")
         pay_link = payment_result.get("payment_link")
         
-        # Calculate INR equivalent for wallet credit
-        # Using a fixed rate; update if you want live conversion
-        amount_inr = int(float(amount_usd) * 83)
-        
         # Store payment in database with oxapay details
         pay_id = ObjectId()
         await m.payments.insert_one({
@@ -161,7 +157,6 @@ async def handle_oxapay_payment(bot: Bot, m: Mongo, user_id: int, amount_usd: fl
             "payment_id": str(pay_id),
             "user_id": user_id,
             "method": "oxapay",
-            "amount_inr": amount_inr,
             "amount_usd": float(amount_usd),
             "oxapay_track_id": track_id,
             "oxapay_pay_link": pay_link,
@@ -450,16 +445,13 @@ def kb_main(user_id: int) -> InlineKeyboardMarkup:
     b.button(text="🛒 Buy Products", callback_data="menu_buy")
     b.button(text="💰 Add Funds", callback_data="menu_addfunds")
     b.button(text="📦 My Orders", callback_data="menu_orders")
-    b.button(text="💼 Wallet", callback_data="menu_wallet")
     b.button(text="📞 Support", callback_data="menu_support")
     b.button(text="👤 My Profile", callback_data="menu_profile")
     if is_admin(user_id):
         b.button(text="🛠 Admin Panel", callback_data="admin_home")
-        # rows: [Buy, AddFunds], [Orders, Wallet], [Support, Profile, Admin]
-        b.adjust(2, 2, 3)
-    else:
-        # rows: [Buy, AddFunds], [Orders, Wallet], [Support, Profile]
         b.adjust(2, 2, 2)
+    else:
+        b.adjust(2, 2, 1)
     return b.as_markup()
 
 
@@ -483,24 +475,16 @@ def kb_categories(categories: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-# USD/INR conversion removed (OxaPay shows amounts/currencies itself)
-USD_INR_RATE = 1.0
-
-
-def format_money(amount_inr: float, currency: str) -> str:
-    cur = (currency or "INR").upper()
-    if cur == "USD":
-        # USD conversion removed
-        return f"₹{int(amount_inr)}"
-    return f"₹{int(amount_inr)}"
+def format_money(amount: float) -> str:
+    return f"${float(amount):.2f}"
 
 
 def format_price(prod: dict[str, Any], currency: str) -> str:
-    cur = (currency or "INR").upper()
-    if cur == "USD":
-        # store as float, show with 2 decimals
-        return f"${round(float(prod.get('price_usd', 0.0)), 2)}"
-    return f"₹{int(prod.get('price_inr', 0))}"
+    # USD-only display
+    usd = prod.get("price_usd")
+    if usd is None:
+        usd = prod.get("price_inr", 0)
+    return f"${round(float(usd), 2)}"
 
 
 def kb_products(products: list[dict[str, Any]], back_cb: str, currency: str) -> InlineKeyboardMarkup:
@@ -614,39 +598,29 @@ async def render_product_detail(m: Mongo, prod: dict[str, Any], user: dict[str, 
     cart = user.get("cart") or {}
     qty = int(cart.get("qty", 1)) if cart.get("product_id") == prod_id else 1
 
-    currency = str(user.get("currency", "INR")).upper()
     stock_count = await m.stocks.count_documents({"product_id": prod["_id"], "status": "available"})
 
-    # Display currency changes only UI; wallet & charging remains INR for now.
-    unit_inr = int(prod.get("price_inr", 0))
-    unit_usd = float(prod.get("price_usd", 0.0))
+    unit_usd = float(prod.get("price_usd", prod.get("price_inr", 0)))
 
     discount_percent = await best_discount_percent(m, prod["_id"], qty)
-    subtotal_inr = unit_inr * qty
-    discount_inr = int(subtotal_inr * discount_percent / 100)
-    total_inr = subtotal_inr - discount_inr
+    subtotal_usd = unit_usd * qty
+    total_usd = subtotal_usd * (1 - discount_percent / 100)
 
-    if currency == "USD":
-        unit_str = f"${unit_usd}"
-        subtotal_str = f"${round(unit_usd * qty, 2)}"
-        discount_str = f"{discount_percent}%"
-        total_str = f"${round(unit_usd * qty * (1 - discount_percent / 100), 2)}"
-    else:
-        unit_str = f"₹{unit_inr}"
-        subtotal_str = f"₹{subtotal_inr}"
-        discount_str = f"{discount_percent}% (₹{discount_inr})"
-        total_str = f"₹{total_inr}"
+    unit_str = f"${round(unit_usd, 2)}"
+    subtotal_str = f"${round(subtotal_usd, 2)}"
+    discount_str = f"{discount_percent}%"
+    total_str = f"${round(total_usd, 2)}"
 
     text = (
         f"<b>{prod['name']}</b>\n"
         f"Category: <code>{prod['category_id']}</code>\n\n"
-        f"Price ({currency}): <b>{unit_str}</b>\n"
+        f"Price (USD): <b>{unit_str}</b>\n"
         f"Available stock: <b>{stock_count}</b>\n\n"
         f"Selected quantity: <b>{qty}</b>\n"
         f"Subtotal: <b>{subtotal_str}</b>\n"
         f"Discount: <b>{discount_str}</b>\n"
         f"Total: <b>{total_str}</b>\n\n"
-        f"Wallet balance: <b>{format_money(int(user.get('balance_inr', 0)), currency)}</b>"
+        f"Wallet balance: <b>{format_money(float(user.get('balance_inr', 0)))}</b>"
     )
     return text, qty
 
@@ -1130,64 +1104,11 @@ async def cb_confirm(call: CallbackQuery, bot: Bot, m: Mongo):
         f"Order ID: <code>{order_id}</code>\n"
         f"Product: <b>{prod['name']}</b>\n"
         f"Quantity: <b>{qty}</b>\n"
-        f"Total: <b>₹{total}</b>\n\n"
+        f"Total: <b>${float(total):.2f}</b>\n\n"
         f"<b>Your items:</b>\n" + "\n".join(f"<code>{x}</code>" for x in delivered)
     )
     await edit_or_send(call, body, kb_main(call.from_user.id))
 
-
-def kb_wallet(currency: str) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    cur = (currency or "INR").upper()
-    b.button(text=f"Currency: {cur}", callback_data="noop")
-    b.button(text="₹ INR" + (" ✅" if cur == "INR" else ""), callback_data="wallet_cur:INR")
-    b.button(text="$ USD" + (" ✅" if cur == "USD" else ""), callback_data="wallet_cur:USD")
-    b.button(text="⬅️ Back", callback_data="home")
-    b.adjust(1, 2, 1)
-    return b.as_markup()
-
-
-@dp.callback_query(F.data == "menu_wallet")
-async def cb_wallet(call: CallbackQuery, bot: Bot, m: Mongo):
-    await upsert_user(m, call)
-    ok = await check_force_join(bot, call.from_user.id)
-    if not ok:
-        await edit_or_send(call, "🔒 Please join our channel to use the bot.", kb_force_join())
-        return
-
-    user = await m.users.find_one({"_id": call.from_user.id})
-    bal_inr = int((user or {}).get("balance_inr", 0))
-    cur = str((user or {}).get("currency", "INR")).upper()
-    await call.answer()
-    await edit_or_send(
-        call,
-        f"💼 <b>Wallet</b>\nBalance: <b>{format_money(bal_inr, cur)}</b>\nSelected currency: <b>{cur}</b>",
-        kb_wallet(cur),
-    )
-
-
-@dp.callback_query(F.data.startswith("wallet_cur:"))
-async def cb_wallet_currency(call: CallbackQuery, bot: Bot, m: Mongo):
-    await upsert_user(m, call)
-    ok = await check_force_join(bot, call.from_user.id)
-    if not ok:
-        await edit_or_send(call, "🔒 Please join our channel to use the bot.", kb_force_join())
-        return
-
-    cur = call.data.split(":", 1)[1].upper()
-    if cur not in {"INR", "USD"}:
-        await call.answer("Invalid", show_alert=True)
-        return
-
-    await m.users.update_one({"_id": call.from_user.id}, {"$set": {"currency": cur}})
-    user = await m.users.find_one({"_id": call.from_user.id})
-    bal_inr = int((user or {}).get("balance_inr", 0))
-    await call.answer("Updated")
-    await edit_or_send(
-        call,
-        f"💼 <b>Wallet</b>\nBalance: <b>{format_money(bal_inr, cur)}</b>\nSelected currency: <b>{cur}</b>",
-        kb_wallet(cur),
-    )
 
 
 @dp.callback_query(F.data == "menu_orders")
@@ -1206,8 +1127,9 @@ async def cb_orders(call: CallbackQuery, bot: Bot, m: Mongo):
 
     lines = ["📦 <b>My Orders</b>"]
     for o in orders:
+        total_usd = float(o.get("total_usd", o.get("total_inr", 0)))
         lines.append(
-            f"\n<b>{o.get('product_name','')}</b> x{o.get('qty',1)} — ₹{o.get('total_inr',0)}\nID: <code>{o['_id']}</code>"
+            f"\n<b>{o.get('product_name','')}</b> x{o.get('qty',1)} — ${total_usd:.2f}\nID: <code>{o['_id']}</code>"
         )
     await edit_or_send(call, "\n".join(lines), kb_back("home"))
 
@@ -1261,7 +1183,7 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot, m: Mongo):
         "👤 <b>My Profile</b>\n\n"
         f"User ID: <code>{user_id}</code>\n"
         f"Username: @{username}\n"
-        f"💰 Total Wallet Balance: ₹{balance_inr}\n"
+        f"💰 Total Wallet Balance: ${float(balance_inr):.2f}\n"
         f"📦 Total Orders: <b>{total_orders}</b>"
     )
     
@@ -1371,13 +1293,11 @@ async def cb_pay_amount(call: CallbackQuery, bot: Bot, m: Mongo):
     await m.users.update_one({"_id": call.from_user.id}, {"$set": {"flow": {"type": "await_amount", "method": method}}})
 
     user = await m.users.find_one({"_id": call.from_user.id})
-    cur = str((user or {}).get("currency", "INR")).upper()
-    # Amounts are stored/credited in INR wallet.
-    # For UPI we always show an INR example, regardless of display currency.
+    # Amounts are stored/credited in USD wallet.
     if method == "upi":
-        prompt = "💵 Send amount as a message (e.g., 100₹)."
+        prompt = "💵 Send amount as a message (e.g., 10$)."
     else:
-        prompt = "💵 Send amount as a message (e.g., 199)." if cur != "USD" else "💵 Send amount as a message (e.g., 10$)."
+        prompt = "💵 Send amount as a message (e.g., 10$)."
 
     # Keep showing the selected payment QR (do NOT revert to START_IMAGE)
     qr = p.get("qr_image")
@@ -2039,14 +1959,14 @@ async def cb_admin_pay_action(call: CallbackQuery, bot: Bot, m: Mongo):
             )
             method_key = str(p.get("method", ""))
             method_name = str(config.PAYMENTS.get(method_key, {}).get("name", method_key)).strip() or method_key
-            amount_inr = int(p.get("amount_inr", 0))
+            amount_usd = float(p.get("amount_usd", 0))
             await bot.send_photo(
                 int(p["user_id"]),
                 photo=str(getattr(config, "START_IMAGE", "")),
                 caption=(
                     f"✅ <b>Payment Approved (Resent)</b>\n"
                     f"Method: <b>{method_name}</b>\n"
-                    f"Amount: <b>₹{amount_inr}</b>\n\n"
+                    f"Amount: <b>${amount_usd:.2f}</b>\n\n"
                     f"Your wallet has been credited."
                 ),
                 parse_mode=ParseMode.HTML,
@@ -2066,7 +1986,7 @@ async def cb_admin_pay_action(call: CallbackQuery, bot: Bot, m: Mongo):
             {"_id": oid},
             {"$set": {"status": "approved", "reviewed_at": utcnow(), "reviewed_by": call.from_user.id}},
         )
-        await m.users.update_one({"_id": p["user_id"]}, {"$inc": {"balance_inr": int(p.get("amount_inr", 0))}})
+        await m.users.update_one({"_id": p["user_id"]}, {"$inc": {"balance_inr": float(p.get("amount_usd", 0))}})
         await admin_log(m, call.from_user.id, "payment_approved", {"payment_id": pid})
 
         # Notify user with START_IMAGE and quick actions
@@ -2081,14 +2001,14 @@ async def cb_admin_pay_action(call: CallbackQuery, bot: Bot, m: Mongo):
             )
             method_key = str(p.get("method", ""))
             method_name = str(config.PAYMENTS.get(method_key, {}).get("name", method_key)).strip() or method_key
-            amount_inr = int(p.get("amount_inr", 0))
+            amount_usd = float(p.get("amount_usd", 0))
             await bot.send_photo(
                 int(p["user_id"]),
                 photo=str(getattr(config, "START_IMAGE", "")),
                 caption=(
                     f"✅ <b>Payment Approved</b>\n"
                     f"Method: <b>{method_name}</b>\n"
-                    f"Amount: <b>₹{amount_inr}</b>\n\n"
+                    f"Amount: <b>${amount_usd:.2f}</b>\n\n"
                     f"Your wallet has been credited."
                 ),
                 parse_mode=ParseMode.HTML,
@@ -2108,14 +2028,14 @@ async def cb_admin_pay_action(call: CallbackQuery, bot: Bot, m: Mongo):
         try:
             method_key = str(p.get("method", ""))
             method_name = str(config.PAYMENTS.get(method_key, {}).get("name", method_key)).strip() or method_key
-            amount_inr = int(p.get("amount_inr", 0))
+            amount_usd = float(p.get("amount_usd", 0))
             await bot.send_photo(
                 int(p["user_id"]),
                 photo=str(getattr(config, "START_IMAGE", "")),
                 caption=(
                     f"❌ <b>Payment Rejected</b>\n"
                     f"Method: <b>{method_name}</b>\n"
-                    f"Amount: <b>₹{amount_inr}</b>\n\n"
+                    f"Amount: <b>${amount_usd:.2f}</b>\n\n"
                     f"If this is a mistake, please contact support."
                 ),
                 parse_mode=ParseMode.HTML,
@@ -2155,7 +2075,8 @@ async def cb_admin_products(call: CallbackQuery, m: Mongo):
     b.button(text="➕ Add Product", callback_data="admin_prod_add")
     for p in prods:
         status = "✅" if p.get("enabled") else "⛔"
-        b.button(text=f"{status} {p['name']} (₹{p['price_inr']})", callback_data=f"admin_prod_open:{p['_id']}")
+        price = p.get("price_usd", p.get("price_inr", 0))
+        b.button(text=f"{status} {p['name']} (${price})", callback_data=f"admin_prod_open:{p['_id']}")
     b.button(text="⬅️ Back", callback_data="admin_home")
     b.adjust(1)
     await call.answer()
@@ -2180,8 +2101,7 @@ async def cb_admin_prod_open(call: CallbackQuery, m: Mongo):
         f"ID: <code>{p['_id']}</code>\n"
         f"Name: <b>{p.get('name','')}</b>\n"
         f"Category: <code>{p.get('category_id','')}</code>\n"
-        f"INR: <b>₹{p.get('price_inr',0)}</b>\n"
-        f"USD: <b>${p.get('price_usd',0)}</b>\n"
+        f"USD: <b>${p.get('price_usd', p.get('price_inr',0))}</b>\n"
         f"Enabled: <b>{bool(p.get('enabled', True))}</b>"
     )
     await call.answer()
@@ -2490,7 +2410,7 @@ async def cb_admin_user_profile(call: CallbackQuery, m: Mongo):
         f"👤 <b>User Profile</b>\n\n"
         f"User ID: <code>{user_id}</code>\n"
         f"Username: @{username}\n"
-        f"💰 Wallet: ₹{balance_inr} (${balance_usd:.2f})\n"
+        f"💰 Wallet: ${float(balance_inr):.2f}\n"
         f"📦 Total Orders: <b>{total_orders}</b>\n"
         f"🚫 Banned: <b>{banned}</b>\n"
         f"📅 Joined: {created_at}"
@@ -2552,98 +2472,7 @@ async def cb_admin_user_action(call: CallbackQuery, m: Mongo):
 # -----------------------------
 
 
-async def oxapay_webhook_handler(request: web.Request) -> web.Response:
-    """Handle OxaPay webhook for automatic payment verification"""
-    try:
-        data = await request.json()
-        
-        # Get bot and mongo from app context
-        bot = request.app["bot"]
-        m = request.app["m"]
-        
-        # Extract payment details from webhook
-        track_id = data.get("trackId")
-        status = data.get("status")  # Waiting, Confirming, Paid, etc.
-        
-        if not track_id:
-            return web.json_response({"status": "error", "message": "Missing trackId"}, status=400)
-        
-        # Find payment in database
-        payment = await m.payments.find_one({"oxapay_track_id": track_id})
-        
-        if not payment:
-            logging.warning(f"OxaPay webhook: Payment not found for track_id {track_id}")
-            return web.json_response({"status": "ok"}, status=200)
-        
-        # Only process if payment is still pending
-        if payment.get("status") != "pending":
-            return web.json_response({"status": "ok", "message": "Already processed"}, status=200)
-        
-        # Check if payment is confirmed
-        if status == "Paid":
-            # Update payment status to approved
-            await m.payments.update_one(
-                {"oxapay_track_id": track_id},
-                {
-                    "$set": {
-                        "status": "approved",
-                        "reviewed_at": utcnow(),
-                        "reviewed_by": "oxapay_auto"
-                    }
-                }
-            )
-            
-            # Credit user wallet
-            user_id = payment["user_id"]
-            amount_inr = payment["amount_inr"]
-            
-            await m.users.update_one(
-                {"_id": user_id},
-                {"$inc": {"balance_inr": amount_inr}},
-                upsert=True
-            )
-            
-            # Log the transaction
-            await admin_log(m, user_id, "payment_approved_auto", {
-                "payment_id": str(payment["_id"]),
-                "amount_inr": amount_inr,
-                "method": "oxapay",
-                "crypto": payment.get("crypto", "USDT")
-            })
-            
-            # Notify user
-            try:
-                crypto_name = "Crypto"
-                kb = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="🛒 Buy Products", callback_data="menu_buy"),
-                            InlineKeyboardButton(text="💼 Wallet", callback_data="menu_wallet"),
-                        ]
-                    ]
-                )
-                await bot.send_photo(
-                    user_id,
-                    photo=str(getattr(config, "START_IMAGE", "")),
-                    caption=(
-                        f"✅ <b>Crypto Payment Confirmed!</b>\n\n"
-                        f"Method: <b>{crypto_name}</b>\n"
-                        f"Amount: <b>₹{amount_inr}</b>\n\n"
-                        f"Your wallet has been credited automatically."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb,
-                )
-            except Exception as e:
-                logging.error(f"Failed to send payment confirmation to user {user_id}: {e}")
-            
-            logging.info(f"OxaPay payment approved automatically: {track_id}")
-        
-        return web.json_response({"status": "ok"}, status=200)
-        
-    except Exception as e:
-        logging.error(f"OxaPay webhook error: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+# Local webhook handler removed (Cloudflare Worker handles webhooks)
 
 
 # NOTE: Webhooks are handled via Cloudflare Worker only.
