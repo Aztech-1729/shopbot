@@ -1538,20 +1538,7 @@ async def on_text(message: Message, bot: Bot, m: Mongo):
             await edit_ui_for_user(bot, m, message.from_user.id, "No product selected.")
             return
 
-        oid = _to_object_id(prod_id)
-        lines = chunk_lines(message.text)
-        if not lines:
-            await edit_ui_for_user(bot, m, message.from_user.id, "No stock lines found.")
-            return
-
-        docs = [
-            {"_id": ObjectId(), "product_id": oid, "content": ln, "status": "available", "created_at": utcnow()}
-            for ln in lines
-        ]
-        await m.stocks.insert_many(docs)
-        await m.users.update_one({"_id": message.from_user.id}, {"$set": {"flow": None}})
-        await edit_ui_for_user(bot, m, message.from_user.id, f"✅ Added {len(docs)} stock lines.", kb_admin_home())
-        return
+        # old admin_stock_paste flow removed
 
     if ftype == "admin_discount_rules" and is_admin(message.from_user.id):
         prod_id = flow.get("product_id")
@@ -2353,24 +2340,6 @@ async def cb_admin_prod_add_cat(call: CallbackQuery, m: Mongo):
     )
     await call.answer()
     await edit_or_send(call, "➕ Send product name", kb_back("admin_prod_add"))
-
-
-@dp.callback_query(F.data == "admin_stock")
-async def cb_admin_stock(call: CallbackQuery, m: Mongo):
-    await upsert_user(m, call)
-    if not is_admin(call.from_user.id):
-        await call.answer("No access", show_alert=True)
-        return
-
-    prods = await m.products.find({}).sort("name", 1).limit(50).to_list(50)
-    b = InlineKeyboardBuilder()
-    for p in prods:
-        b.button(text=p["name"], callback_data=f"admin_stock_for:{p['_id']}")
-    b.button(text="⬅️ Back", callback_data="admin_home")
-    b.adjust(1)
-    await call.answer()
-    await edit_or_send(call, "📥 <b>Select product to add stock</b>", b.as_markup())
-
 
 
 @dp.callback_query(F.data == "admin_discounts")
