@@ -1009,7 +1009,7 @@ async def cb_buy(call: CallbackQuery, bot: Bot, m: Mongo):
     )
 
 
-async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty: int, total: int) -> tuple[str, list[str]]:
+async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty: int, total: float) -> tuple[str, list[str]]:
     session = await m.client.start_session()
     async with session:
         async with session.start_transaction():
@@ -1017,8 +1017,8 @@ async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty
             if not user or user.get("banned"):
                 raise ValueError("Access denied")
 
-            balance = int(user.get("balance_inr", 0))
-            if balance < total:
+            balance = float(user.get("balance_inr", 0))
+            if balance < float(total):
                 raise ValueError("Insufficient wallet balance")
 
             stocks = await m.stocks.find(
@@ -1029,8 +1029,12 @@ async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty
             if len(stocks) < qty:
                 raise ValueError("Not enough stock available")
 
-            delivered_lines = [str(s.get("content", "")) for s in stocks]
+            delivered_lines = []
             stock_ids = [s["_id"] for s in stocks]
+            for s in stocks:
+                email = s.get("email") or ""
+                password = s.get("password") or ""
+                delivered_lines.append(f"Email: {email}\nPassword: {password}")  # clean format
 
             await m.stocks.update_many(
                 {"_id": {"$in": stock_ids}},
@@ -1040,7 +1044,7 @@ async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty
 
             await m.users.update_one(
                 {"_id": user_id},
-                {"$inc": {"balance_inr": -int(total)}},
+                {"$inc": {"balance_inr": -float(total)}},
                 session=session,
             )
 
@@ -1052,7 +1056,7 @@ async def purchase_transaction(m: Mongo, user_id: int, prod: dict[str, Any], qty
                     "product_id": prod["_id"],
                     "product_name": prod["name"],
                     "qty": qty,
-                    "total_inr": int(total),
+                    "total_usd": float(total),
                     "delivered": delivered_lines,
                     "created_at": utcnow(),
                 },
@@ -1109,10 +1113,10 @@ async def cb_confirm(call: CallbackQuery, bot: Bot, m: Mongo):
         await call.answer("Product not found", show_alert=True)
         return
 
-    unit = int(prod["price_inr"])
+    unit = float(prod.get("price_usd", prod.get("price_inr", 0)))
     discount_percent = await best_discount_percent(m, prod["_id"], qty)
     subtotal = unit * qty
-    discount = int(subtotal * discount_percent / 100)
+    discount = subtotal * (float(discount_percent) / 100.0)
     total = subtotal - discount
 
     try:
@@ -1122,15 +1126,32 @@ async def cb_confirm(call: CallbackQuery, bot: Bot, m: Mongo):
         return
 
     await call.answer("✅ Purchased")
-    body = (
-        f"✅ <b>Order Delivered</b>\n"
-        f"Order ID: <code>{order_id}</code>\n"
+
+    caption = (
+        f"✅ <b>Purchase Successful</b>\n\n"
         f"Product: <b>{prod['name']}</b>\n"
         f"Quantity: <b>{qty}</b>\n"
-        f"Total: <b>${float(total):.2f}</b>\n\n"
-        f"<b>Your items:</b>\n" + "\n".join(f"<code>{x}</code>" for x in delivered)
+        f"Total Paid: <b>${float(total):.2f}</b>\n\n"
+        f"<b>Account Details:</b>\n" + "\n\n".join(f"<code>{x}</code>" for x in delivered)
     )
-    await edit_or_send(call, body, kb_main(call.from_user.id))
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 My Orders", callback_data="menu_orders")]
+        ]
+    )
+
+    await bot.send_photo(
+        call.from_user.id,
+        photo=str(product_image_for(prod.get("name", "")) or getattr(config, "START_IMAGE", "")),
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+    # Clean up the confirmation message
+    with contextlib.suppress(Exception):
+        await call.message.delete()
 
 
 
@@ -1238,7 +1259,7 @@ async def cb_order_view(call: CallbackQuery, bot: Bot, m: Mongo):
     
     # Show delivered items if available
     if status == "delivered" and order.get("items"):
-        text += "\n\n<b>Your Items:</b>\n"
+        text += "\n\n<b>Account Details:</b>\n"
         for item in order["items"]:
             text += f"<code>{item}</code>\n"
     
@@ -1308,7 +1329,7 @@ async def cb_menu_profile(call: CallbackQuery, bot: Bot, m: Mongo):
         "👤 <b>My Profile</b>\n\n"
         f"User ID: <code>{user_id}</code>\n"
         f"Username: @{username}\n"
-        f"💰 Total Wallet Balance: ${float(balance_inr):.2f}\n"
+        f"💰 Total Balance: ${float(balance_inr):.2f}\n"
         f"💳 Total Spent: ${total_spent:.2f}\n"
         f"📦 Total Orders: <b>{total_orders}</b>"
     )
