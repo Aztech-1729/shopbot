@@ -2372,21 +2372,6 @@ async def cb_admin_stock(call: CallbackQuery, m: Mongo):
     await edit_or_send(call, "📥 <b>Select product to add stock</b>", b.as_markup())
 
 
-@dp.callback_query(F.data.startswith("admin_stock_for:"))
-async def cb_admin_stock_for(call: CallbackQuery, m: Mongo):
-    await upsert_user(m, call)
-    if not is_admin(call.from_user.id):
-        await call.answer("No access", show_alert=True)
-        return
-
-    prod_id = call.data.split(":", 1)[1]
-    await m.users.update_one(
-        {"_id": call.from_user.id},
-        {"$set": {"flow": {"type": "admin_stock_paste", "product_id": prod_id}}},
-    )
-    await call.answer()
-    await edit_or_send(call, "📥 Paste stock lines now (one per line).", kb_back("admin_stock"))
-
 
 @dp.callback_query(F.data == "admin_discounts")
 async def cb_admin_discounts(call: CallbackQuery, m: Mongo):
